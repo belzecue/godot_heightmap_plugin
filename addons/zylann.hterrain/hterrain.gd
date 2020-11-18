@@ -56,6 +56,7 @@ const _builtin_shaders = {
 }
 
 const _NORMAL_BAKER_PATH = "res://addons/zylann.hterrain/tools/normalmap_baker.gd"
+const _LOOKDEV_SHADER_PATH = "res://addons/zylann.hterrain/shaders/lookdev.shader"
 
 const SHADER_PARAM_INVERSE_TRANSFORM = "u_terrain_inverse_transform"
 const SHADER_PARAM_NORMAL_BASIS = "u_terrain_normal_basis"
@@ -114,10 +115,8 @@ const _DEBUG_AABB = false
 
 signal transform_changed(global_transform)
 
-export var collision_enabled := true setget set_collision_enabled
 export(float, 0.0, 1.0) var ambient_wind := 0.0 setget set_ambient_wind
 export(int, 2, 5) var lod_scale := 2.0 setget set_lod_scale, get_lod_scale
-export(Shader) var custom_globalmap_shader
 
 # TODO Replace with `size` in world units?
 # Prefer using this instead of scaling the node's transform.
@@ -126,6 +125,7 @@ export(Shader) var custom_globalmap_shader
 export var map_scale := Vector3(1, 1, 1) setget set_map_scale
 
 var _custom_shader : Shader = null
+var _custom_globalmap_shader : Shader = null
 var _shader_type := SHADER_CLASSIC4_LITE
 var _shader_uses_texture_array := false
 var _material := ShaderMaterial.new()
@@ -152,7 +152,10 @@ var _pending_chunk_updates := []
 
 var _detail_layers := []
 
+var _collision_enabled := true
 var _collider: HTerrainCollider = null
+var _collision_layer := 1
+var _collision_mask := 1
 
 # Stats & debug
 var _updated_chunks := 0
@@ -160,6 +163,9 @@ var _logger = Logger.get_for(self)
 
 # Editor-only
 var _normals_baker = null
+
+var _lookdev_enabled := false
+var _lookdev_material : ShaderMaterial
 
 
 func _init():
@@ -187,12 +193,14 @@ func _init():
 		e.resize(GROUND_TEXTURE_TYPE_COUNT)
 		_ground_textures[slot] = e
 
-	if collision_enabled:
+	if _collision_enabled:
 		if _check_heightmap_collider_support():
-			_collider = HTerrainCollider.new(self)
+			_collider = HTerrainCollider.new(self, _collision_layer, _collision_mask)
 
 
 func _get_property_list():
+	# A lot of properties had to be exported like this instead of using `export`,
+	# because Godot 3 does not support easy categorization and lacks some hints
 	var props = [
 		{
 			# Terrain data is exposed only as a path in the editor,
@@ -221,6 +229,33 @@ func _get_property_list():
 			"hint_string": "16, 32"
 		},
 		{
+			"name": "Collision",
+			"type": TYPE_NIL,
+			"usage": PROPERTY_USAGE_GROUP
+		},
+		{
+			"name": "collision_enabled",
+			"type": TYPE_BOOL,
+			"usage": PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_STORAGE
+		},
+		{
+			"name": "collision_layer",
+			"type": TYPE_INT,
+			"usage": PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_STORAGE,
+			"hint": PROPERTY_HINT_LAYERS_3D_PHYSICS
+		},
+		{
+			"name": "collision_mask",
+			"type": TYPE_INT,
+			"usage": PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_STORAGE,
+			"hint": PROPERTY_HINT_LAYERS_3D_PHYSICS
+		},
+		{
+			"name": "Shader",
+			"type": TYPE_NIL,
+			"usage": PROPERTY_USAGE_GROUP
+		},
+		{
 			"name": "shader_type",
 			"type": TYPE_STRING,
 			"usage": PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_STORAGE,
@@ -228,8 +263,14 @@ func _get_property_list():
 			"hint_string": _SHADER_TYPE_HINT_STRING
 		},
 		{
-			# Had to specify it like this because need to be in category...
 			"name": "custom_shader",
+			"type": TYPE_OBJECT,
+			"usage": PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_STORAGE,
+			"hint": PROPERTY_HINT_RESOURCE_TYPE,
+			"hint_string": "Shader"
+		},
+		{
+			"name": "custom_globalmap_shader",
 			"type": TYPE_OBJECT,
 			"usage": PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_STORAGE,
 			"hint": PROPERTY_HINT_RESOURCE_TYPE,
@@ -288,6 +329,9 @@ func _get(key: String):
 
 	elif key == "custom_shader":
 		return get_custom_shader()
+	
+	elif key == "custom_globalmap_shader":
+		return _custom_globalmap_shader
 
 	elif key.begins_with("shader_params/"):
 		var param_name = key.right(len("shader_params/"))
@@ -295,7 +339,16 @@ func _get(key: String):
 
 	elif key == "chunk_size":
 		return _chunk_size
+	
+	elif key == "collision_enabled":
+		return _collision_enabled
+	
+	elif key == "collision_layer":
+		return _collision_layer
 
+	elif key == "collision_mask":
+		return _collision_mask
+	
 
 func _set(key: String, value):
 	if key == "data_directory":
@@ -318,6 +371,9 @@ func _set(key: String, value):
 
 	elif key == "custom_shader":
 		set_custom_shader(value)
+	
+	elif key == "custom_globalmap_shader":
+		_custom_globalmap_shader = value
 
 	elif key.begins_with("shader_params/"):
 		var param_name = key.right(len("shader_params/"))
@@ -325,6 +381,19 @@ func _set(key: String, value):
 
 	elif key == "chunk_size":
 		set_chunk_size(value)
+		
+	elif key == "collision_enabled":
+		set_collision_enabled(value)
+
+	elif key == "collision_layer":
+		_collision_layer = value
+		if _collider != null:
+			_collider.set_collision_layer(value)
+
+	elif key == "collision_mask":
+		_collision_mask = value
+		if _collider != null:
+			_collider.set_collision_mask(value)
 
 
 func get_shader_param(param_name: String):
@@ -371,11 +440,11 @@ func _check_heightmap_collider_support() -> bool:
 
 
 func set_collision_enabled(enabled: bool):
-	if collision_enabled != enabled:
-		collision_enabled = enabled
-		if collision_enabled:
+	if _collision_enabled != enabled:
+		_collision_enabled = enabled
+		if _collision_enabled:
 			if _check_heightmap_collider_support():
-				_collider = HTerrainCollider.new(self)
+				_collider = HTerrainCollider.new(self, _collision_layer, _collision_mask)
 				# Collision is not updated with data here,
 				# because loading is quite a mess at the moment...
 				# 1) This function can be called while no data has been set yet
@@ -571,8 +640,7 @@ func set_data(new_data: HTerrainData):
 
 	_material_params_need_update = true
 	
-	if has_method("update_configuration_warning"):
-		call("update_configuration_warning")
+	Util.update_configuration_warning(self, true)
 	
 	_logger.debug("Set data done")
 
@@ -581,7 +649,7 @@ func set_data(new_data: HTerrainData):
 # so the whole collider can be updated in one go.
 # It may be slow for ingame use, so prefer calling it when appropriate.
 func update_collider():
-	assert(collision_enabled)
+	assert(_collision_enabled)
 	assert(_collider != null)
 	_collider.create_from_terrain_data(_data)
 
@@ -642,17 +710,25 @@ func _on_data_map_changed(type: int, index: int):
 func _on_data_map_added(type: int, index: int):
 	if type == HTerrainData.CHANNEL_DETAIL:
 		for layer in _detail_layers:
+			# Shift indexes up since one was inserted
+			if layer.layer_index >= index:
+				layer.layer_index += 1
 			layer.update_material()
 	else:
 		_material_params_need_update = true
+	Util.update_configuration_warning(self, true)
 
 
 func _on_data_map_removed(type: int, index: int):
 	if type == HTerrainData.CHANNEL_DETAIL:
 		for layer in _detail_layers:
+			# Shift indexes down since one was removed
+			if layer.layer_index > index:
+				layer.layer_index -= 1
 			layer.update_material()
 	else:
 		_material_params_need_update = true
+	Util.update_configuration_warning(self, true)
 
 
 func get_shader_type() -> String:
@@ -718,9 +794,13 @@ func _on_custom_shader_changed():
 func _update_material_params():
 	assert(_material != null)
 	_logger.debug("Updating terrain material params")
-	
+		
 	var terrain_textures := {}
 	var res := Vector2(-1, -1)
+	
+	var lookdev_material : ShaderMaterial
+	if _lookdev_enabled:
+		lookdev_material = _get_lookdev_material()
 
 	# TODO Only get textures the shader supports
 
@@ -742,10 +822,16 @@ func _update_material_params():
 		# This is needed to properly transform normals if the terrain is scaled
 		var normal_basis = gt.basis.inverse().transposed()
 		_material.set_shader_param(SHADER_PARAM_NORMAL_BASIS, normal_basis)
+		
+		if lookdev_material != null:
+			lookdev_material.set_shader_param(SHADER_PARAM_INVERSE_TRANSFORM, t)
+			lookdev_material.set_shader_param(SHADER_PARAM_NORMAL_BASIS, normal_basis)
 	
 	for param_name in terrain_textures:
 		var tex = terrain_textures[param_name]
 		_material.set_shader_param(param_name, tex)
+		if lookdev_material != null:
+			lookdev_material.set_shader_param(param_name, tex)
 
 	for slot in len(_ground_textures):
 		var textures = _ground_textures[slot]
@@ -803,8 +889,8 @@ func setup_globalmap_material(mat: ShaderMaterial):
 # Gets which shader will be used to bake the globalmap
 func get_globalmap_shader() -> Shader:
 	if _shader_type == SHADER_CUSTOM:
-		if custom_globalmap_shader != null:
-			return custom_globalmap_shader
+		if _custom_globalmap_shader != null:
+			return _custom_globalmap_shader
 		_logger.warn("The terrain uses a custom shader but doesn't have one for baking the "
 			+ "global map. Will attempt to use a built-in shader.")
 		if is_using_texture_array():
@@ -1071,12 +1157,16 @@ func _cb_make_chunk(cpos_x: int, cpos_y: int, lod: int):
 		var lod_factor := _lodder.get_lod_size(lod)
 		var origin_in_cells_x := cpos_x * _chunk_size * lod_factor
 		var origin_in_cells_y := cpos_y * _chunk_size * lod_factor
+		
+		var material = _material
+		if _lookdev_enabled:
+			material = _get_lookdev_material()
 
 		if _DEBUG_AABB:
 			chunk = HTerrainChunkDebug.new(
-				self, origin_in_cells_x, origin_in_cells_y, _material)
+				self, origin_in_cells_x, origin_in_cells_y, material)
 		else:
-			chunk = HTerrainChunk.new(self, origin_in_cells_x, origin_in_cells_y, _material)
+			chunk = HTerrainChunk.new(self, origin_in_cells_x, origin_in_cells_y, material)
 		chunk.parent_transform_changed(get_internal_transform())
 
 		var grid = _chunks[lod]
@@ -1252,6 +1342,33 @@ func _get_configuration_warning():
 		return "The terrain is missing data.\n" \
 			+ "Select the `Data Directory` property in the inspector to assign it."
 	return ""
+
+
+func set_lookdev_enabled(enable: bool):
+	if _lookdev_enabled == enable:
+		return
+	_lookdev_enabled = enable
+	_material_params_need_update = true
+	if _lookdev_enabled:
+		_for_all_chunks(SetMaterialAction.new(_get_lookdev_material()))
+	else:
+		_for_all_chunks(SetMaterialAction.new(_material))
+
+
+func set_lookdev_shader_param(param_name: String, value):
+	var mat = _get_lookdev_material()
+	mat.set_shader_param(param_name, value)
+
+
+func is_lookdev_enabled() -> bool:
+	return _lookdev_enabled
+
+
+func _get_lookdev_material() -> ShaderMaterial:
+	if _lookdev_material == null:
+		_lookdev_material = ShaderMaterial.new()
+		_lookdev_material.shader = load(_LOOKDEV_SHADER_PATH)
+	return _lookdev_material
 
 
 class PendingChunkUpdate:

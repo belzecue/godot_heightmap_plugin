@@ -10,6 +10,8 @@ HTerrain plugin documentation
     - [Basic sculpting](#basic-sculpting)
         - [Using the brush](#using-the-brush)
         - [Normals](#normals)
+        - [Collisions](#collisions)
+            - [Known issues](#known-issues)
     - [Texturing](#texturing)
         - [Overview](#overview)
         - [Classic4 workflow](#classic4-workflow)
@@ -19,6 +21,7 @@ HTerrain plugin documentation
         - [Setting up bump, normals and roughness](#setting-up-bump-normals-and-roughness)
         - [Depth blending](#depth-blending)
         - [Triplanar mapping](#triplanar-mapping)
+        - [Tiling reduction](#tiling-reduction)
         - [Color tint](#color-tint)
     - [Holes](#holes)
     - [Terrain generator](#terrain-generator)
@@ -38,8 +41,11 @@ HTerrain plugin documentation
     - [Custom shaders](#custom-shaders)
         - [Ground shaders](#ground-shaders)
         - [Grass shaders](#grass-shaders)
+    - [Lookdev](#lookdev)
     - [Scripting](#scripting)
+        - [Overview](#overview)
         - [Creating the terrain from script](#creating-the-terrain-from-script)
+        - [Modifying terrain from script](#modifying-terrain-from-script)
         - [Procedural generation](#procedural-generation)
     - [Export](#export)
     - [GDNative](#gdnative)
@@ -125,6 +131,26 @@ Note: heightmaps work best for hills and large mountains, but making sharp cliff
 ### Normals
 
 As you sculpt, the plugin automatically recomputes normals of the terrain, and saves it in a texture. This way, it can be used directly in ground shaders, grass shaders and previews at a smaller cost. Also, it allows to keep the same amount of details in the distance independently from geometry, which allows for levels of detail to work without affecting perceived quality too much.
+
+
+### Collisions
+
+You can enable or disable collisions by checking the `Collisions enabled` property in the inspector.
+
+Heightmap-based terrains usually implement collisions directly using the heightmap, which saves a lot of computations compared to a classic mesh collider.
+This plugin depends on the **Bullet Physics** integration in Godot, which does have a height-field collider. **Godot Physics** does not support it, so you may want to make sure Bullet is enabled in your project settings:
+
+![Screenshot of the option to choose physics engines in project settings](images/choose_bullet_physics.png)
+
+Some editor tools rely on colliders to work, such as snapping to ground or plugins like Scatter or other prop placement utilities. To make sure the collider is up to date, you can force it to update after sculpting with the `Terrain -> Update Editor Collider` menu:
+
+![Screenshot of the menu to update the collider](images/update_editor_collider.png)
+
+#### Known issues
+
+- **Updating the collider**: In theory, Bullet allows us to specify a direct reference to the image data. This would allow the collider to automatically update for free. However, we still had to duplicate the heightmap for safety, to avoid potential crashes if it gets mis-used. Even if we didn't copy it, the link could be broken anytime because of internal Copy-on-Write behavior in Godot. This is why the collider update is manual, because copying the heightmap results in an expensive operation. It can't be threaded as well because in Godot physics engines are not thread-safe yet. It might be improved in the future, hopefully.
+
+- **Misaligned collider in editor**: At time of writing, the Bullet integration has an issue about colliders in the editor if the terrain is translated, which does not happen in game: https://github.com/godotengine/godot/issues/37337
 
 
 Texturing
@@ -237,6 +263,14 @@ For this reason, the plugin uses the following convention in ground textures:
 
 This operation can be done in an image editing program such as Gimp, or with a Godot plugin such as Channel Packer (available on the asset library: https://godotengine.org/asset-library/asset/230).
 
+Note 1: normal maps must follow the OpenGL convention, where Y goes up. They are recognizable by being "brighter" on the top of bumpy features (because Y is green, which is the most energetic color to the human eye):
+
+![Examples of normalmap conventions](images/normalmap_conventions.png)
+
+See also https://docs.godotengine.org/en/latest/getting_started/workflow/assets/importing_images.html#normal-map
+
+Note 2: because Godot would strip out the alpha channel if a packed texture was imported as a normal map, you should not make your texture import as "Normal Map" in the importer dock.
+
 
 ### Depth blending
 
@@ -258,6 +292,28 @@ Making cliffs with a heightmap terrain is not recommended, because it stretches 
 In the case of the `CLASSIC4` shader, cliffs usually are made of the same ground texture, so it is only available for textures setup in the 4th slot, called `cliff`. It could be made to work on all slots, however it involves modifying the shader to add more options, which you may see in a later article.
 
 The `ARRAY` shader does not have triplanar mapping yet, but it may be added in the future.
+
+
+### Tiling reduction
+
+The fact repeating textures are used for the ground also means they will not look as good at medium to far distance, due to the pattern it produces:
+
+![Screenshot of tiling artifacts](images/tiling_artifacts.png)
+
+On shaders supporting it, the `tile_reduction` parameter allows to break the patterns a bit to attenuate the effect:
+
+![Screenshot of reduced tiling artifacts](images/tiling_reduction.png)
+
+This option is present under the form of a `vec4`, where each component correspond to a texture, so you can enable it for some of them and not the others. Set a component to `1` to enable it, and `0` to disable it.
+
+This algorithm makes the shader sample the texture a second time, at a different orientation and scale, at semi-random areas of the ground:
+
+![Screenshot of the warped checker pattern used to break repetitions](images/warped_checker_variations.png)
+
+Here you can see where each of the two texture variants are being rendered. The pattern is a warped checker, which is simple enough to be procedural (avoiding the use of a noise texture), but organic enough so it shouldn't create artifacts itself. The result is made seamless by using depth blending (see [Depth blending](#depth-blending)).
+
+Although it's still possible to notice repetition over larger distances, this can be better covered by using a fade to global map (see [Global map](#global-map)).
+In addition, many games don't present a naked terrain to players: there are usually many props on top of it, such as grass, vegetation, trees, rocks, buildings, fog etc. so overall tiling textures should not really be a big deal.
 
 
 ### Color tint
@@ -376,7 +432,16 @@ Once you have textured ground, you may want to add small detail objects to it, s
 ### Painting details
 
 Grass is supported throught `HTerrainDetailLayer` node. They can be created as children of the `HTerrain` node. Each layer represents one kind of detail, so you may have one layer for grass, and another for flowers, for example.
-Each layer allocates an 8-bit map over the whole terrain where each pixel tells how much density of that layer there is. Because of this technique, you can paint details just like you paint anything else, using the same brush system. It uses opacity to either add more density, or act as an eraser with an opacity of zero.
+
+Detail layers come in two parts:
+- A 8-bit density texture covering the whole terrain, also called a "detail map" at the moment. You can see how many maps the terrain has in the bottom panel after selecting the terrain.
+- A `HTerrainDetailLayer` node, which uses one of the detail maps to render instanced models based on the density.
+
+You can paint detail maps just like you paint anything else, using the same brush system. It uses opacity to either add more density, or act as an eraser with an opacity of zero.
+`HTerrainDetailLayer` nodes will then update in realtime, rendering more or less instances in places you painted.
+
+Note: a detail map can be used by more than one node (by setting the same index in their `layer_index` property), so you can have one for grass, another for flowers, and paint on the shared map to see both nodes update at the same time.
+
 
 ### Shading options
 
@@ -398,6 +463,8 @@ Several meshes are bundled with the plugin, which you can find in `res://addons/
 ![Bundled grass models](images/grass_models.png)
 
 They are all thought for grass rendering. You can make your own for things that aren't grass, however there is no built-in shader for conventional objects at the moment (rocks, bits and bobs). So if you want normal shading you need to write a custom shader. That may be bundled too in the future.
+
+Note: detail meshes must be `Mesh` resources, so the easiest way is to use the `OBJ` format. If you use `GLTF` or `FBX`, Godot will import it as a scene by default, so you may have to configure it to import as single mesh if possible.
 
 
 Global map
@@ -481,8 +548,55 @@ Parameter name                      | Type             | Format  | Description
 `u_ambient_wind`                    | `vec2`           |         | Combined `vec2` parameter for ambient wind. `x` is the amplitude, and `y` is a time value. It is better to use it instead of directly `TIME` because it allows to animate speed without causing stutters.
 
 
+Lookdev 
+---------
+
+The plugin features an experimental debugging feature in the `Terrain` menu called "Lookdev". It temporarily replaces the ground shader with a simpler one which displays the raw value of a specific map. For example, you can see the actual values taken by a detail map by choosing one of them in the menu:
+
+![Screenshot of detail map seen with lookdev shader](images/lookdev_grass.png)
+
+It is very simple at the moment but it can also be used to display data maps which are not necessarily used for rendering. So you could also use it to paint them, even if they don't translate into a visual element in the game.
+Note: the heightmap cannot be seen with this feature because its values extend beyond usual color ranges.
+
+To turn it off, select `Disabled` in the menu.
+
+![Screenshot of detail map seen with lookdev shader](images/lookdev_menu.png)
+
+
 Scripting
 --------------
+
+### Overview
+
+Scripts relevant to in-game functionality are located under the plugin's root folder, `res://addons/zylann.hterrain/`.
+
+```
+res://
+- addons/
+    - zylann.hterrain/
+        - doc/
+        - models/                    <-- Models used for grass
+        - native/                    <-- GDNative library
+        - shaders/                   
+        - tools/                     <-- Editor-specific stuff, don't use in game
+        - util/                      <-- Various helper scripts
+
+        - hterrain.gd                <-- The HTerrain node
+        - hterrain_data.gd           <-- The HTerrainData resource
+        - hterrain_detail_layer.gd   <-- The HTerrainDetailLayer node
+
+        - (other stuff used internally)
+```
+
+This plugin does not use global class names, so to use or hint one of these types, you may want to "const-import" them on top of your script, like so:
+
+```gdscript
+const HTerrain = preload("res://addons/zylann.hterrain/hterrain.gd")
+```
+
+There is no API documentation yet, so if you want to see which functions and properties are available, take a look at the source code in the editor.
+Functions and properties beginning with a `_` are private and should not be used directly.
+
 
 ### Creating the terrain from script
 
@@ -494,9 +608,7 @@ extends Node
 const HTerrain = preload("res://addons/zylann.hterrain/hterrain.gd")
 const HTerrainData = preload("res://addons/zylann.hterrain/hterrain_data.gd")
 
-
 func _ready():
-
     var data = HTerrainData.new()
     data.resize(513)
     
@@ -505,12 +617,42 @@ func _ready():
     add_child(terrain)
 ```
 
+### Modifying terrain from script
+
+The terrain is described by several types of large textures, such as heightmap, normal map, grass maps, color map and so on. Modifying the terrain boils down to modifying them using the `Image` API.
+
+For example, this code will tint the ground red at a specific position (in pixels, not world space):
+
+```gdscript
+const HTerrainData = preload("res://addons/zylann.hterrain/hterrain_data.gd")
+
+onready var _terrain = $Path/To/Terrain
+
+func test():
+    # Get the image
+    var data : HTerrainData = _terrain.get_data()
+    var colormap : Image = data.get_image(HTerrainData.CHANNEL_COLOR)
+
+    # Modify the image
+    var position = Vector2(42, 36)
+    colormap.lock()
+    colormap.set_pixel(position, Color(1, 0, 0))
+    colormap.unlock()
+
+    # Notify the terrain of our change
+    data.notify_region_changed(Rect2(position.x, position.y, 1, 1), HTerrainData.CHANNEL_COLOR)
+```
+
+The same goes for the heightmap and grass maps, however at time of writing, there are several issues with editing it in game:
+- Normals of the terrain don't automatically update, you have to calculate them yourself by also modifying the normalmap. This is a bit tedious and expensive, however it may be improved in the future. Alternatively you could compute them in shader, but it makes rendering a bit more expensive.
+- The collider won't update either, for the same reason mentionned in the [section about collisions in the editor](#Collisions). You can force it to update by calling `update_collider()` but it can cause a hiccup.
+
 
 ### Procedural generation
 
 It is possible to generate the terrain data entirely from script. It may be quite slow if you don't take advantage of GPU techniques (such as using a compute viewport), but it's still useful to copy results to the terrain or editing it like the plugin does in the editor.
 
-It all boils down to generating images, using the `Image` resource.
+Again, we can use the `Image` resource to modify pixels.
 Here is a full GDScript example generating a terrain from noise and 3 textures:
 
 ```gdscript
@@ -596,6 +738,7 @@ func _ready():
 	# No need to call this, but you may need to if you edit the terrain later on
 	#terrain.update_collider()
 ```
+
 
 Export
 ----------
@@ -731,6 +874,7 @@ This issue happened a few times and had various causes so if the checks mentionn
 - If they are present, make sure Godot has imported those textures. If it didn't, unfocus the editor, and focus it back (you should see a short progress bar as it does it)
 - Check if you used Ctrl+Z (undo) after a non-undoable action: https://github.com/Zylann/godot_heightmap_plugin/issues/101
 - If your problem relates to collisions in editor, update the collider using `Terrain -> Update Editor Collider`, because this one does not update automatically yet
+- Godot seems to randomly forget where the terrain saver is, but I need help to find out why because I could never reproduce it: https://github.com/Zylann/godot_heightmap_plugin/issues/120
 
 
 ### Temporary files
