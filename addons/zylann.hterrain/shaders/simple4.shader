@@ -6,7 +6,9 @@ shader_type spatial;
 
 uniform sampler2D u_terrain_heightmap;
 uniform sampler2D u_terrain_normalmap;
-uniform sampler2D u_terrain_colormap : hint_albedo;
+// I had to remove `hint_albedo` from colormap because it makes sRGB conversion kick in,
+// which snowballs to black when doing GPU painting on that texture...
+uniform sampler2D u_terrain_colormap;
 uniform sampler2D u_terrain_splatmap;
 uniform sampler2D u_terrain_globalmap : hint_albedo;
 uniform mat4 u_terrain_inverse_transform;
@@ -184,8 +186,7 @@ void vertex() {
 	v_splat = texture(u_terrain_splatmap, UV);
 
 	// Need to use u_terrain_normal_basis to handle scaling.
-	NORMAL = u_terrain_normal_basis 
-		* unpack_normal(texture(u_terrain_normalmap, UV));
+	NORMAL = u_terrain_normal_basis * unpack_normal(texture(u_terrain_normalmap, UV));
 
 	v_distance_to_camera = distance(wpos.xyz, CAMERA_MATRIX[3].xyz);
 }

@@ -29,7 +29,7 @@ https://github.com/Zylann/godot_hterrain_demo
 Usage
 ----------
 
-- ![General documentation](addons/zylann.hterrain/doc/main.md)
+- [Documentation](https://hterrain-plugin.readthedocs.io/en/latest/)
 
 - I also made a video about the 0.8 version of the plugin: https://www.youtube.com/watch?v=eZuvfIHDeT4& Careful, it's a bit old and may not entirely reflect the last version. Use the text docs for most up to date information.
 
@@ -60,3 +60,19 @@ Here are some of the causes:
 - The procedural generator doesn't work, and likely never will in GLES2 because it relies on HDR framebuffers.
 
 - For more info, see https://github.com/Zylann/godot_heightmap_plugin/issues/96
+
+
+Supporters
+-----------
+
+This plugin is a non-profit project developped by voluntary contributors. The following is the list of the current donors.
+Thanks for your support :)
+
+### Supporters
+
+```
+- wacyym
+- Sergey Lapin (slapin)
+- Jonas (NoFr1ends)
+- lenis0012
+```
